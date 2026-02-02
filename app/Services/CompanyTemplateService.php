@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Models\Company;
+use App\Services\PdfTemplateAnalyzer;
 use App\Models\Staff;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
@@ -28,7 +29,88 @@ class CompanyTemplateService
         $fullPath = Storage::disk('local')->path($company->template_path);
 
         // If template is PDF, generate a staff PDF and merge with template PDF
-        if (($company->template_type ?? 'excel') === 'pdf') {
+        $type = $company->template_type ?? 'excel';
+
+        if ($type === 'html') {
+            // Load generated HTML template and repeat placeholder row for each staff
+            $htmlPath = $company->template_path;
+            $html = Storage::get($htmlPath);
+
+            $staff = $company->staff()->orderBy('id')->get();
+            if ($staff->isEmpty()) {
+                throw new \RuntimeException('No staff data found for this company.');
+            }
+
+            libxml_use_internal_errors(true);
+            $doc = new \DOMDocument();
+            $doc->loadHTML($html);
+            $tbodies = $doc->getElementsByTagName('tbody');
+            $generatedRowsHtml = '';
+
+            if ($tbodies->length > 0) {
+                $tbody = $tbodies->item(0);
+                $rows = $tbody->getElementsByTagName('tr');
+                if ($rows->length > 0) {
+                    $placeholderNode = $rows->item(0);
+                    $placeholderHtml = $doc->saveHTML($placeholderNode);
+
+                    foreach ($staff as $member) {
+                        $rowHtml = preg_replace_callback('/\{\{\s*(\w+)\s*\}\}/', function ($m) use ($member) {
+                            $key = $m[1];
+                            $val = $member->{$key} ?? null;
+                            if ($val instanceof \Carbon\CarbonInterface) return htmlspecialchars($val->toDateString());
+                            return htmlspecialchars((string) ($val ?? ''));
+                        }, $placeholderHtml);
+
+                        $generatedRowsHtml .= $rowHtml;
+                    }
+
+                    // Replace tbody content with generated rows
+                    while ($tbody->firstChild) {
+                        $tbody->removeChild($tbody->firstChild);
+                    }
+                    $fragment = $doc->createDocumentFragment();
+                    @$fragment->appendXML($generatedRowsHtml);
+                    $tbody->appendChild($fragment);
+                }
+            } else {
+                // No tbody: fallback - append simple table with staff rows
+                $generatedRowsHtml = '';
+                foreach ($staff as $member) {
+                    $generatedRowsHtml .= '<tr>' .
+                        '<td>' . e($member->employee_id) . '</td>' .
+                        '<td>' . e($member->first_name) . '</td>' .
+                        '<td>' . e($member->last_name) . '</td>' .
+                        '<td>' . e($member->email) . '</td>' .
+                        '</tr>';
+                }
+                // insert at end of body
+                $bodies = $doc->getElementsByTagName('body');
+                if ($bodies->length > 0) {
+                    $body = $bodies->item(0);
+                    $frag = $doc->createDocumentFragment();
+                    @$frag->appendXML('<table>' . $generatedRowsHtml . '</table>');
+                    $body->appendChild($frag);
+                }
+            }
+
+            $finalHtml = $doc->saveHTML();
+
+            // Render to PDF
+            $dompdf = new \Dompdf\Dompdf();
+            $dompdf->loadHtml($finalHtml);
+            $dompdf->setPaper('A4', 'portrait');
+            $dompdf->render();
+
+            Storage::disk('local')->makeDirectory('exports');
+            $out = 'exports/company_' . $company->id . '_staff.pdf';
+            $fullOut = Storage::disk('local')->path($out);
+            file_put_contents($fullOut, $dompdf->output());
+
+            return $out;
+        }
+
+        if ($type === 'pdf') {
             $staff = $company->staff()->orderBy('id')->get();
             if ($staff->isEmpty()) {
                 throw new \RuntimeException('No staff data found for this company.');
@@ -50,7 +132,9 @@ class CompanyTemplateService
                 '<h2>Staff for ' . e($company->name) . '</h2>' .
                 '<table><thead><tr><th>Employee ID</th><th>First</th><th>Last</th><th>Email</th><th>Phone</th></tr></thead><tbody>' . $rows . '</tbody></table></body></html>';
 
-            $tempStaffPdf = storage_path('app/exports/company_' . $company->id . '_staff_temp.pdf');
+            Storage::disk('local')->makeDirectory('exports');
+
+            $tempStaffPdf = Storage::disk('local')->path('exports/company_' . $company->id . '_staff_temp.pdf');
             // Render HTML to PDF
             $dompdf = new \Dompdf\Dompdf();
             $dompdf->loadHtml($html);
@@ -59,17 +143,34 @@ class CompanyTemplateService
             file_put_contents($tempStaffPdf, $dompdf->output());
 
             // Merge template PDF with staff PDF (template first)
-            $mergedPath = storage_path('app/exports/company_' . $company->id . '_staff.pdf');
+            $mergedPath = Storage::disk('local')->path('exports/company_' . $company->id . '_staff.pdf');
             $pdf = new \setasign\Fpdi\Fpdi();
 
             // We'll create filled pages by overlaying fields onto template pages for each staff member
             $mappings = $company->template_mapping['pdf'] ?? [];
             if (empty($mappings)) {
                 // Fallback: append a staff list PDF after template
-                $mergedPath = storage_path('app/exports/company_' . $company->id . '_staff.pdf');
+                $mergedPath = Storage::disk('local')->path('exports/company_' . $company->id . '_staff.pdf');
                 $pdf = new \setasign\Fpdi\Fpdi();
                 // import template
-                $pageCount = $pdf->setSourceFile($fullPath);
+                try {
+                    $pageCount = $pdf->setSourceFile($fullPath);
+                } catch (\setasign\Fpdi\PdfParser\CrossReference\CrossReferenceException $e) {
+                    try {
+                        $fixed = $this->ensurePdfReadable($fullPath, $company->id);
+                        $pageCount = $pdf->setSourceFile($fixed);
+                    } catch (\Throwable $ee) {
+                        if (class_exists(PdfTemplateAnalyzer::class)) {
+                            $analyzer = new PdfTemplateAnalyzer();
+                            $generated = $analyzer->analyzeAndGenerateHtml($company);
+                            $company->template_path = $generated;
+                            $company->template_type = 'html';
+                            $company->save();
+                            return $this->populateTemplate($company);
+                        }
+                        throw $ee;
+                    }
+                }
                 for ($i = 1; $i <= $pageCount; $i++) {
                     $tpl = $pdf->importPage($i);
                     $size = $pdf->getTemplateSize($tpl);
@@ -77,7 +178,24 @@ class CompanyTemplateService
                     $pdf->useTemplate($tpl);
                 }
                 // import staff pdf
-                $pageCount = $pdf->setSourceFile($tempStaffPdf);
+                try {
+                    $pageCount = $pdf->setSourceFile($tempStaffPdf);
+                } catch (\setasign\Fpdi\PdfParser\CrossReference\CrossReferenceException $e) {
+                    try {
+                        $fixed = $this->ensurePdfReadable($tempStaffPdf, $company->id);
+                        $pageCount = $pdf->setSourceFile($fixed);
+                    } catch (\Throwable $ee) {
+                        if (class_exists(PdfTemplateAnalyzer::class)) {
+                            $analyzer = new PdfTemplateAnalyzer();
+                            $generated = $analyzer->analyzeAndGenerateHtml($company);
+                            $company->template_path = $generated;
+                            $company->template_type = 'html';
+                            $company->save();
+                            return $this->populateTemplate($company);
+                        }
+                        throw $ee;
+                    }
+                }
                 for ($i = 1; $i <= $pageCount; $i++) {
                     $tpl = $pdf->importPage($i);
                     $size = $pdf->getTemplateSize($tpl);
@@ -89,11 +207,45 @@ class CompanyTemplateService
                 return 'exports/company_' . $company->id . '_staff.pdf';
             }
 
-            $templatePageCount = (new \setasign\Fpdi\Fpdi())->setSourceFile($fullPath);
+            try {
+                $templatePageCount = (new \setasign\Fpdi\Fpdi())->setSourceFile($fullPath);
+            } catch (\setasign\Fpdi\PdfParser\CrossReference\CrossReferenceException $e) {
+                try {
+                    $fixed = $this->ensurePdfReadable($fullPath, $company->id);
+                    $templatePageCount = (new \setasign\Fpdi\Fpdi())->setSourceFile($fixed);
+                } catch (\Throwable $ee) {
+                    if (class_exists(PdfTemplateAnalyzer::class)) {
+                        $analyzer = new PdfTemplateAnalyzer();
+                        $generated = $analyzer->analyzeAndGenerateHtml($company);
+                        $company->template_path = $generated;
+                        $company->template_type = 'html';
+                        $company->save();
+                        return $this->populateTemplate($company);
+                    }
+                    throw $ee;
+                }
+            }
 
             // Use FPDI to create per-staff filled pages
             $fpdi = new \setasign\Fpdi\Fpdi();
-            $templatePageCount = $fpdi->setSourceFile($fullPath);
+            try {
+                $templatePageCount = $fpdi->setSourceFile($fullPath);
+            } catch (\setasign\Fpdi\PdfParser\CrossReference\CrossReferenceException $e) {
+                try {
+                    $fixed = $this->ensurePdfReadable($fullPath, $company->id);
+                    $templatePageCount = $fpdi->setSourceFile($fixed);
+                } catch (\Throwable $ee) {
+                    if (class_exists(PdfTemplateAnalyzer::class)) {
+                        $analyzer = new PdfTemplateAnalyzer();
+                        $generated = $analyzer->analyzeAndGenerateHtml($company);
+                        $company->template_path = $generated;
+                        $company->template_type = 'html';
+                        $company->save();
+                        return $this->populateTemplate($company);
+                    }
+                    throw $ee;
+                }
+            }
 
             foreach ($staff as $member) {
                 for ($p = 1; $p <= $templatePageCount; $p++) {
@@ -345,5 +497,55 @@ class CompanyTemplateService
         }
 
         return $value;
+    }
+
+    /**
+     * Attempt to make a PDF readable by FPDI by running `qpdf` to disable object streams / compression.
+     * Returns path to a (possibly) new normalized PDF file.
+     */
+    private function ensurePdfReadable(string $path, int $companyId): string
+    {
+        // If file already exists at path and appears readable, just return it
+        if (is_readable($path)) {
+            // quick attempt: try opening with FPDI
+            return $path;
+        }
+
+        // Prepare output normalized path
+        Storage::disk('local')->makeDirectory('exports');
+        $normalized = Storage::disk('local')->path('exports/company_' . $companyId . '_template_normalized.pdf');
+
+        // Check if qpdf is available
+        $checkCmd = 'qpdf --version 2>&1';
+        exec($checkCmd, $out, $ret);
+        if ($ret !== 0) {
+            // qpdf not available; try ghostscript as fallback
+            $gsCmd = 'gs -v 2>&1';
+            exec($gsCmd, $gos, $gret);
+            if ($gret !== 0) {
+                throw new \RuntimeException('PDF parser failed and neither qpdf nor ghostscript are available to normalize the file. See https://www.setasign.com/fpdi-pdf-parser');
+            }
+            // use ghostscript to rewrite PDF
+            $cmd = sprintf('gs -q -dNOPAUSE -dBATCH -sDEVICE=pdfwrite -dPDFSETTINGS=/prepress -sOutputFile=%s %s', escapeshellarg($normalized), escapeshellarg($path));
+            exec($cmd, $o, $r2);
+            if ($r2 === 0 && file_exists($normalized)) return $normalized;
+            throw new \RuntimeException('Failed to normalize PDF using Ghostscript.');
+        }
+
+        // Run qpdf to disable object streams and expand
+        $cmd = sprintf('qpdf --qdf --object-streams=disable %s %s', escapeshellarg($path), escapeshellarg($normalized));
+        exec($cmd, $o, $r);
+        if ($r === 0 && file_exists($normalized)) {
+            return $normalized;
+        }
+
+        // fallback try uncompressing streams
+        $cmd2 = sprintf('qpdf --stream-data=uncompress %s %s', escapeshellarg($path), escapeshellarg($normalized));
+        exec($cmd2, $o2, $r3);
+        if ($r3 === 0 && file_exists($normalized)) {
+            return $normalized;
+        }
+
+        throw new \RuntimeException('PDF parser failed and qpdf failed to normalize the file. See https://www.setasign.com/fpdi-pdf-parser for options.');
     }
 }

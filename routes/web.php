@@ -22,8 +22,16 @@ Route::post('/companies/{company}/generate-staff', [CompanyStaffController::clas
 
 Route::get('/companies/{company}/template/mapping', [CompanyTemplateMappingController::class, 'show'])
     ->name('companies.template.mapping');
+Route::get('/companies/{company}/template/file', [CompanyTemplateMappingController::class, 'file'])
+    ->name('companies.template.file');
 Route::post('/companies/{company}/template/mapping', [CompanyTemplateMappingController::class, 'store'])
     ->name('companies.template.mapping.store');
 
+Route::post('/companies/{company}/template/analyze', [CompanyTemplateMappingController::class, 'analyze'])
+    ->name('companies.template.analyze');
+Route::get('/companies/{company}/template/preview', [CompanyTemplateMappingController::class, 'preview'])
+    ->name('companies.template.preview');
+
 Route::post('/companies/{company}/template', [CompanyTemplateController::class, 'upload']);
-Route::get('/companies/{company}/template', [CompanyTemplateController::class, 'downloadPopulated']);
+Route::get('/companies/{company}/template', [CompanyTemplateController::class, 'downloadPopulated'])
+    ->name('companies.template.download');

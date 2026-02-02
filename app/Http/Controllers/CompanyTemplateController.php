@@ -38,7 +38,8 @@ class CompanyTemplateController extends Controller
     {
         try {
             $outputPath = $service->populateTemplate($company);
-            $downloadName = 'company_' . $company->id . '_staff.xlsx';
+            $ext = pathinfo($outputPath, PATHINFO_EXTENSION);
+            $downloadName = 'company_' . $company->id . '_staff.' . $ext;
             return Storage::disk('local')->download($outputPath, $downloadName);
         } catch (\RuntimeException $e) {
             return redirect()
